@@ -105,3 +105,9 @@ InitTestScene*.unity*
 
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+
+# Local ML-Agents tooling and training output
+/.tools/
+/.venv_mlagents/
+/results/
+/summaries/
