@@ -1,4 +1,6 @@
 using System.Collections.Generic;
+using Unity.Burst;
+using Unity.InferenceEngine;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
 using Unity.MLAgents.Policies;
@@ -7,17 +9,39 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.Controls;
 using UnityEngine.UI;
+using Random = UnityEngine.Random;
+
+public enum TeamControlMode
+{
+    Learner,
+    TrainedModel,
+    RandomWalker,
+    Keyboard,
+}
 
 public sealed class TerritoryControlGame : MonoBehaviour
 {
     public const int NeutralOwner = -1;
     public const int BlueTeam = 0;
     public const int OrangeTeam = 1;
-    public const int ObservationSize = 21;
+    private const int VisionRadius = 2;
+    private const int VisionDiameter = VisionRadius * 2 + 1;
+    private const int VisionCellCount = VisionDiameter * VisionDiameter;
+    public const int ObservationSize = 87;
 
     [Header("Episode")]
     [SerializeField] private int maxEnvironmentSteps = 1800;
     [SerializeField] private bool enableKeyboardShortcuts = true;
+
+    [Header("Matchup")]
+    [SerializeField] private TeamControlMode blueControlMode = TeamControlMode.TrainedModel;
+    [SerializeField] private TeamControlMode orangeControlMode = TeamControlMode.TrainedModel;
+
+    [Header("Inference")]
+    [SerializeField] private bool loadTrainedModel = true;
+    [SerializeField] private string trainedModelResourcePath = "Models/TerritoryPainter";
+    [SerializeField] private InferenceDevice inferenceDevice = InferenceDevice.Burst;
+    [SerializeField] private bool disableBurstCompilationForLocalInference = true;
 
     [Header("Arena")]
     [SerializeField] private int gridWidth = 25;
@@ -33,12 +57,17 @@ public sealed class TerritoryControlGame : MonoBehaviour
     private Material neutralMaterial;
     private Material blueMaterial;
     private Material orangeMaterial;
+    private Transform agentRoot;
     private Text scoreText;
     private Text statusText;
+    private ModelAsset trainedModel;
     private int environmentStep;
     private int episodeIndex = 1;
     private bool paused;
     private bool endingEpisode;
+    private bool environmentReady;
+    private bool burstCompilationWasEnabled;
+    private bool burstCompilationOverridden;
 
     public int Width => gridWidth;
     public int Height => gridHeight;
@@ -57,18 +86,26 @@ public sealed class TerritoryControlGame : MonoBehaviour
     private void Awake()
     {
         Random.InitState(System.DateTime.UtcNow.Millisecond);
+        ConfigureInferenceRuntime();
         Academy.Instance.AutomaticSteppingEnabled = true;
 
         CreateMaterials();
+        LoadTrainedModel();
         CreateArena();
         CreateAgents();
         CreateLightingAndCamera();
         CreateHud();
         ResetEnvironment();
+        environmentReady = true;
     }
 
     private void FixedUpdate()
     {
+        if (!environmentReady)
+        {
+            return;
+        }
+
         HandleKeyboard();
 
         if (!IsRunning)
@@ -88,6 +125,14 @@ public sealed class TerritoryControlGame : MonoBehaviour
         UpdateHud();
     }
 
+    private void OnDestroy()
+    {
+        if (burstCompilationOverridden)
+        {
+            BurstCompiler.Options.EnableBurstCompilation = burstCompilationWasEnabled;
+        }
+    }
+
     public Vector3 GridToWorld(Vector2Int cell)
     {
         float x = (cell.x - (gridWidth - 1) * 0.5f) * tileSize;
@@ -104,7 +149,13 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
     public int GetOwner(Vector2Int cell)
     {
-        return IsInBounds(cell) ? tiles[cell.x, cell.y].Owner : NeutralOwner;
+        if (tiles == null || !IsInBounds(cell))
+        {
+            return NeutralOwner;
+        }
+
+        TileCell tile = tiles[cell.x, cell.y];
+        return tile == null ? NeutralOwner : tile.Owner;
     }
 
     public bool PaintTile(Vector3 worldPosition, int teamId, out int previousOwner)
@@ -112,12 +163,17 @@ public sealed class TerritoryControlGame : MonoBehaviour
         Vector2Int cell = WorldToGrid(worldPosition);
         previousOwner = NeutralOwner;
 
-        if (!IsInBounds(cell))
+        if (tiles == null || !IsInBounds(cell))
         {
             return false;
         }
 
         TileCell tile = tiles[cell.x, cell.y];
+        if (tile == null)
+        {
+            return false;
+        }
+
         previousOwner = tile.Owner;
 
         if (previousOwner == teamId)
@@ -142,17 +198,32 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
         sensor.AddObservation(teamSide * NormalizeCoord(cell.x, gridWidth));
         sensor.AddObservation(NormalizeCoord(cell.y, gridHeight));
-        sensor.AddObservation(OwnerSignal(GetOwner(cell), agent.TeamId));
 
-        Vector2Int[] offsets =
+        for (int y = VisionRadius; y >= -VisionRadius; y--)
         {
-            new(0, 1), new(1, 1), new(1, 0), new(1, -1),
-            new(0, -1), new(-1, -1), new(-1, 0), new(-1, 1),
-        };
+            for (int x = -VisionRadius; x <= VisionRadius; x++)
+            {
+                Vector2Int observedCell = cell + new Vector2Int(x, y);
+                sensor.AddObservation(OwnerSignal(GetOwner(observedCell), agent.TeamId));
+            }
+        }
 
-        foreach (Vector2Int offset in offsets)
+        for (int y = VisionRadius; y >= -VisionRadius; y--)
         {
-            sensor.AddObservation(OwnerSignal(GetOwner(cell + offset), agent.TeamId));
+            for (int x = -VisionRadius; x <= VisionRadius; x++)
+            {
+                Vector2Int observedCell = cell + new Vector2Int(x, y);
+                sensor.AddObservation(HasAgentInCell(observedCell, agent.TeamId, agent) ? 1f : 0f);
+            }
+        }
+
+        for (int y = VisionRadius; y >= -VisionRadius; y--)
+        {
+            for (int x = -VisionRadius; x <= VisionRadius; x++)
+            {
+                Vector2Int observedCell = cell + new Vector2Int(x, y);
+                sensor.AddObservation(HasAgentInCell(observedCell, 1 - agent.TeamId, agent) ? 1f : 0f);
+            }
         }
 
         sensor.AddObservation(Mathf.Clamp(toEnemy.x / (tileSize * 8f), -1f, 1f));
@@ -196,6 +267,12 @@ public sealed class TerritoryControlGame : MonoBehaviour
         return FindNearestAgent(seeker, maxDistance, true);
     }
 
+    public float GetNearestFriendDistance(TerritoryPainterAgent seeker, float maxDistance)
+    {
+        TerritoryPainterAgent friend = FindNearestFriend(seeker, maxDistance);
+        return friend == null ? maxDistance : Vector3.Distance(seeker.transform.position, friend.transform.position);
+    }
+
     public void ResolveTag(TerritoryPainterAgent tagger, TerritoryPainterAgent tagged)
     {
         tagger.AddReward(0.35f);
@@ -208,8 +285,18 @@ public sealed class TerritoryControlGame : MonoBehaviour
         return teamId == BlueTeam ? blueColor : orangeColor;
     }
 
+    public TeamControlMode GetControlMode(int teamId)
+    {
+        return teamId == BlueTeam ? blueControlMode : orangeControlMode;
+    }
+
     private void ResetEnvironment()
     {
+        if (tiles == null)
+        {
+            return;
+        }
+
         endingEpisode = false;
         environmentStep = 0;
 
@@ -217,7 +304,11 @@ public sealed class TerritoryControlGame : MonoBehaviour
         {
             for (int y = 0; y < gridHeight; y++)
             {
-                tiles[x, y].SetOwner(NeutralOwner, neutralMaterial);
+                TileCell tile = tiles[x, y];
+                if (tile != null)
+                {
+                    tile.SetOwner(NeutralOwner, neutralMaterial);
+                }
             }
         }
 
@@ -226,7 +317,10 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
         foreach (TerritoryPainterAgent agent in agents)
         {
-            agent.ResetForEpisode(GetSpawnPoint(agent.TeamId));
+            if (agent != null)
+            {
+                agent.ResetForEpisode(GetSpawnPoint(agent.TeamId));
+            }
         }
     }
 
@@ -244,6 +338,11 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
         foreach (TerritoryPainterAgent agent in agents)
         {
+            if (agent == null)
+            {
+                continue;
+            }
+
             float teamResult = agent.TeamId == BlueTeam ? normalizedDiff : -normalizedDiff;
             agent.AddReward(teamResult);
             agent.EndEpisode();
@@ -257,7 +356,22 @@ public sealed class TerritoryControlGame : MonoBehaviour
     {
         foreach (TerritoryPainterAgent agent in agents)
         {
+            if (agent == null)
+            {
+                continue;
+            }
+
             agent.AddReward(-0.0005f);
+
+            float nearestFriendDistance = GetNearestFriendDistance(agent, tileSize * 5f);
+            if (nearestFriendDistance < tileSize * 1.35f)
+            {
+                agent.AddReward(-0.0025f);
+            }
+            else if (nearestFriendDistance > tileSize * 3.25f)
+            {
+                agent.AddReward(0.0006f);
+            }
         }
     }
 
@@ -282,6 +396,18 @@ public sealed class TerritoryControlGame : MonoBehaviour
         {
             FinishEpisode();
         }
+
+        if (Keyboard.current.f1Key.wasPressedThisFrame)
+        {
+            blueControlMode = NextControlMode(blueControlMode);
+            RebuildAgents();
+        }
+
+        if (Keyboard.current.f2Key.wasPressedThisFrame)
+        {
+            orangeControlMode = NextControlMode(orangeControlMode);
+            RebuildAgents();
+        }
     }
 
     private void CreateMaterials()
@@ -289,6 +415,35 @@ public sealed class TerritoryControlGame : MonoBehaviour
         neutralMaterial = CreateMaterial(neutralColor);
         blueMaterial = CreateMaterial(blueColor);
         orangeMaterial = CreateMaterial(orangeColor);
+    }
+
+    private void LoadTrainedModel()
+    {
+        if (!loadTrainedModel || !AnyTeamUsesTrainedModel())
+        {
+            return;
+        }
+
+        trainedModel = Resources.Load<ModelAsset>(trainedModelResourcePath);
+        if (trainedModel == null)
+        {
+            Debug.LogWarning($"No trained ML-Agents model found at Resources/{trainedModelResourcePath}. Agents will use heuristic fallback unless a trainer is connected.");
+        }
+    }
+
+    private void ConfigureInferenceRuntime()
+    {
+        if (loadTrainedModel && AnyTeamUsesTrainedModel() && disableBurstCompilationForLocalInference)
+        {
+            burstCompilationWasEnabled = BurstCompiler.Options.EnableBurstCompilation;
+            burstCompilationOverridden = true;
+            BurstCompiler.Options.EnableBurstCompilation = false;
+        }
+    }
+
+    private bool AnyTeamUsesTrainedModel()
+    {
+        return blueControlMode == TeamControlMode.TrainedModel || orangeControlMode == TeamControlMode.TrainedModel;
     }
 
     private static Material CreateMaterial(Color color)
@@ -323,11 +478,12 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
     private void CreateAgents()
     {
-        Transform agentRoot = new GameObject("ML Territory Agents").transform;
+        agentRoot = new GameObject("ML Territory Agents").transform;
         agentRoot.SetParent(transform);
 
         for (int team = 0; team < 2; team++)
         {
+            TeamControlMode controlMode = GetControlMode(team);
             for (int i = 0; i < agentsPerTeam; i++)
             {
                 GameObject agentObject = GameObject.CreatePrimitive(PrimitiveType.Capsule);
@@ -341,7 +497,7 @@ public sealed class TerritoryControlGame : MonoBehaviour
                 renderer.sharedMaterial = CreateMaterial(GetTeamColor(team));
 
                 TerritoryPainterAgent agent = agentObject.AddComponent<TerritoryPainterAgent>();
-                agent.Initialize(this, team);
+                agent.Initialize(this, team, controlMode);
 
                 BehaviorParameters behavior = agentObject.GetComponent<BehaviorParameters>();
                 if (behavior == null)
@@ -351,9 +507,9 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
                 behavior.BehaviorName = "TerritoryPainter";
                 behavior.TeamId = team;
-                behavior.BehaviorType = BehaviorType.Default;
                 behavior.BrainParameters.VectorObservationSize = ObservationSize;
                 behavior.BrainParameters.ActionSpec = ActionSpec.MakeContinuous(2);
+                ConfigureBehavior(behavior, controlMode);
 
                 DecisionRequester requester = agentObject.AddComponent<DecisionRequester>();
                 requester.DecisionPeriod = 1;
@@ -363,6 +519,51 @@ public sealed class TerritoryControlGame : MonoBehaviour
                 agentObject.SetActive(true);
             }
         }
+    }
+
+    private void ConfigureBehavior(BehaviorParameters behavior, TeamControlMode controlMode)
+    {
+        behavior.Model = null;
+
+        switch (controlMode)
+        {
+            case TeamControlMode.TrainedModel when trainedModel != null:
+                behavior.InferenceDevice = inferenceDevice;
+                behavior.Model = trainedModel;
+                behavior.BehaviorType = BehaviorType.InferenceOnly;
+                break;
+            case TeamControlMode.Learner:
+                behavior.BehaviorType = BehaviorType.Default;
+                break;
+            case TeamControlMode.Keyboard:
+            case TeamControlMode.RandomWalker:
+            case TeamControlMode.TrainedModel:
+            default:
+                behavior.BehaviorType = BehaviorType.HeuristicOnly;
+                break;
+        }
+    }
+
+    private void RebuildAgents()
+    {
+        foreach (TerritoryPainterAgent agent in agents)
+        {
+            if (agent != null)
+            {
+                Destroy(agent.gameObject);
+            }
+        }
+
+        agents.Clear();
+
+        if (agentRoot != null)
+        {
+            Destroy(agentRoot.gameObject);
+            agentRoot = null;
+        }
+
+        CreateAgents();
+        ResetEnvironment();
     }
 
     private void CreateLightingAndCamera()
@@ -434,6 +635,11 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
     private void UpdateHud()
     {
+        if (scoreText == null || statusText == null)
+        {
+            return;
+        }
+
         CountTiles(out int blueTiles, out int orangeTiles, out int neutralTiles);
         int paintedTiles = Mathf.Max(1, gridWidth * gridHeight - neutralTiles);
         float blueShare = blueTiles / (float)paintedTiles;
@@ -443,17 +649,37 @@ public sealed class TerritoryControlGame : MonoBehaviour
         scoreText.text = $"EPISODE {episodeIndex}\nBLUE {blueTiles} ({blueShare:P0})\nORANGE {orangeTiles} ({orangeShare:P0})";
         statusText.text = paused
             ? "PAUSED"
-            : $"ML-AGENTS\nSTEPS {remainingSteps}\nR reset  N end";
+            : $"{blueControlMode} vs {orangeControlMode}\nSTEPS {remainingSteps}\nR reset  N end\nF1/F2 matchup";
+    }
+
+    private static TeamControlMode NextControlMode(TeamControlMode mode)
+    {
+        return mode switch
+        {
+            TeamControlMode.Learner => TeamControlMode.TrainedModel,
+            TeamControlMode.TrainedModel => TeamControlMode.RandomWalker,
+            TeamControlMode.RandomWalker => TeamControlMode.Keyboard,
+            _ => TeamControlMode.Learner,
+        };
     }
 
     private void PaintBaseZone(int teamId)
     {
+        if (tiles == null)
+        {
+            return;
+        }
+
         Vector2Int center = WorldToGrid(GetSpawnPoint(teamId));
         for (int x = Mathf.Max(0, center.x - 1); x <= Mathf.Min(gridWidth - 1, center.x + 1); x++)
         {
             for (int y = Mathf.Max(0, center.y - 2); y <= Mathf.Min(gridHeight - 1, center.y + 2); y++)
             {
-                tiles[x, y].SetOwner(teamId, GetTeamMaterial(teamId));
+                TileCell tile = tiles[x, y];
+                if (tile != null)
+                {
+                    tile.SetOwner(teamId, GetTeamMaterial(teamId));
+                }
             }
         }
     }
@@ -465,7 +691,7 @@ public sealed class TerritoryControlGame : MonoBehaviour
 
         foreach (TerritoryPainterAgent other in agents)
         {
-            if (other == seeker || other.IsRespawning || (other.TeamId == seeker.TeamId) != sameTeam)
+            if (other == null || other == seeker || other.IsRespawning || (other.TeamId == seeker.TeamId) != sameTeam)
             {
                 continue;
             }
@@ -479,6 +705,29 @@ public sealed class TerritoryControlGame : MonoBehaviour
         }
 
         return nearest;
+    }
+
+    private bool HasAgentInCell(Vector2Int cell, int teamId, TerritoryPainterAgent except)
+    {
+        if (!IsInBounds(cell))
+        {
+            return false;
+        }
+
+        foreach (TerritoryPainterAgent agent in agents)
+        {
+            if (agent == null || agent == except || agent.TeamId != teamId || agent.IsRespawning)
+            {
+                continue;
+            }
+
+            if (WorldToGrid(agent.transform.position) == cell)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private Material GetTeamMaterial(int teamId)
@@ -512,11 +761,24 @@ public sealed class TerritoryControlGame : MonoBehaviour
         orangeTiles = 0;
         neutralTiles = 0;
 
+        if (tiles == null)
+        {
+            neutralTiles = gridWidth * gridHeight;
+            return;
+        }
+
         for (int x = 0; x < gridWidth; x++)
         {
             for (int y = 0; y < gridHeight; y++)
             {
-                switch (tiles[x, y].Owner)
+                TileCell tile = tiles[x, y];
+                if (tile == null)
+                {
+                    neutralTiles++;
+                    continue;
+                }
+
+                switch (tile.Owner)
                 {
                     case BlueTeam:
                         blueTiles++;
@@ -543,16 +805,20 @@ public sealed class TerritoryPainterAgent : Agent
     private TerritoryControlGame game;
     private Renderer bodyRenderer;
     private Vector3 actionDirection;
+    private TeamControlMode controlMode;
+    private Vector2 scriptedInput;
     private float nextPaintAt;
     private float respawnUntil;
+    private float nextScriptedTurnAt;
 
     public int TeamId { get; private set; }
     public bool IsRespawning => Time.time < respawnUntil;
 
-    public void Initialize(TerritoryControlGame owner, int teamId)
+    public void Initialize(TerritoryControlGame owner, int teamId, TeamControlMode mode)
     {
         game = owner;
         TeamId = teamId;
+        controlMode = mode;
         bodyRenderer = GetComponent<Renderer>();
     }
 
@@ -601,10 +867,14 @@ public sealed class TerritoryPainterAgent : Agent
         ActionSegment<float> continuous = actionsOut.ContinuousActions;
         Vector2 input = Vector2.zero;
 
-        if (Keyboard.current != null)
+        if (controlMode == TeamControlMode.Keyboard && Keyboard.current != null)
         {
             input.x = ReadAxis(Keyboard.current.dKey, Keyboard.current.aKey);
             input.y = ReadAxis(Keyboard.current.wKey, Keyboard.current.sKey);
+        }
+        else
+        {
+            input = GetScriptedInput();
         }
 
         continuous[0] = input.x;
@@ -615,6 +885,8 @@ public sealed class TerritoryPainterAgent : Agent
     {
         transform.position = spawnPoint + Random.insideUnitSphere.WithY(0f) * 0.35f;
         actionDirection = Random.insideUnitSphere.WithY(0f).normalized;
+        scriptedInput = Random.insideUnitCircle.normalized;
+        nextScriptedTurnAt = Time.time + Random.Range(0.25f, 0.85f);
         respawnUntil = 0f;
         nextPaintAt = 0f;
 
@@ -660,7 +932,19 @@ public sealed class TerritoryPainterAgent : Agent
         nextPaintAt = Time.time + paintInterval;
         if (game.PaintTile(transform.position, TeamId, out int previousOwner))
         {
-            AddReward(previousOwner == TerritoryControlGame.NeutralOwner ? 0.08f : 0.18f);
+            float reward = previousOwner == TerritoryControlGame.NeutralOwner ? 0.08f : 0.18f;
+            float nearestFriendDistance = game.GetNearestFriendDistance(this, game.TileSize * 5f);
+
+            if (nearestFriendDistance > game.TileSize * 2.75f)
+            {
+                reward += 0.025f;
+            }
+            else if (nearestFriendDistance < game.TileSize * 1.35f)
+            {
+                reward -= 0.02f;
+            }
+
+            AddReward(reward);
         }
     }
 
@@ -694,6 +978,17 @@ public sealed class TerritoryPainterAgent : Agent
         }
 
         return value;
+    }
+
+    private Vector2 GetScriptedInput()
+    {
+        if (Time.time >= nextScriptedTurnAt || scriptedInput.sqrMagnitude < 0.05f)
+        {
+            scriptedInput = Random.insideUnitCircle.normalized;
+            nextScriptedTurnAt = Time.time + Random.Range(0.35f, 1.1f);
+        }
+
+        return scriptedInput;
     }
 
     private static void AddEmptyObservations(VectorSensor sensor)
